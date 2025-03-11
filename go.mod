@@ -1,8 +1,6 @@
 module project/zonal-shift
 
-go 1.23.0
-
-toolchain go1.23.6
+go 1.21
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.29.6

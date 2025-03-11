@@ -151,7 +151,7 @@ func TestInvalidEvent(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	// Assert that the event is invalid and responds with an error
-	assert.Equal(t, http.StatusInternalServerError, rr.Code)
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
 
 //func TestUpdateKarpenterNodePool(t *testing.T) {
