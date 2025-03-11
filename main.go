@@ -5,16 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	//"io"
 	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
 	"os"
-
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	//"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	//"github.com/aws/aws-sdk-go-v2/aws"
+	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
 )
 
 // SNSMessage represents the structure of an SNS notification
@@ -52,6 +54,36 @@ type Metadata struct {
 	AwayFrom string `json:"awayFrom"`
 	Notes    string `json:"notes"`
 }
+
+// NodePool represents the structure of a Karpenter NodePool
+type NodePool struct {
+    APIVersion string `json:"apiVersion"`
+    Kind       string `json:"kind"`
+    Metadata   struct {
+        Name      string            `json:"name"`
+        Namespace string            `json:"namespace"`
+        Labels    map[string]string `json:"labels,omitempty"`
+    } `json:"metadata"`
+    Spec struct {
+        Template struct {
+            Spec struct {
+                Requirements []struct {
+                    Key      string   `json:"key"`
+                    Operator string   `json:"operator"`
+                    Values   []string `json:"values"`
+                } `json:"requirements"`
+                NodeClassRef struct {
+                    Name string `json:"name"`
+                } `json:"nodeClassRef"`
+            } `json:"spec"`
+        } `json:"template"`
+        Limits struct {
+            CPU    string `json:"cpu,omitempty"`
+            Memory string `json:"memory,omitempty"`
+        } `json:"limits,omitempty"`
+    } `json:"spec"`
+}
+
 
 func init() {
 	// Open log file
@@ -156,6 +188,89 @@ func handleEvent(event Event) {
 	}()
 }
 
+// CreateNodePool creates a new Karpenter NodePool
+func CreateNodePool(ctx context.Context, nodepoolName, namespace string, nodePoolSpec []byte) error {
+    k8sConfig, err := rest.InClusterConfig()
+	if err != nil {
+		log.Printf("[CreateNodePoolNodePool] Failed to create cluster config: %v", err)
+		fmt.Errorf("failed to create request: %v", err)
+	}
+
+	//clientset, err := kubernetes.NewForConfig(k8sConfig)
+	//if err != nil {
+	//	log.Printf("[CreateNodePoolNodePool] Failed to create clientset: %v", err)
+	//	fmt.Errorf("failed to create request: %v", err)
+	//}
+    
+    // Create the request URL
+    url := fmt.Sprintf("%s/apis/karpenter.sh/v1/namespaces/%s/nodepools",
+        k8sConfig.Host,
+        namespace,
+    )
+
+    // Create the HTTP request
+    req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(nodePoolSpec))
+    if err != nil {
+        return fmt.Errorf("failed to create request: %v", err)
+    }
+
+    // Set headers
+    req.Header.Set("Content-Type", "application/json")
+    //req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", clientset.BearerToken))
+
+    // Execute the request
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return fmt.Errorf("failed to execute request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    // Check response status
+    if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("failed to create nodepool, status: %d", resp.StatusCode)
+    }
+
+    return nil
+}
+
+
+// Create a function to identity the updated Availability zones after ignoring the AwayFrom zone. 
+func getUpdatedZones(event Event) ([]string) {
+	region := event.Region
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		log.Printf("Failed to load AWS config: %v", err)
+	}
+	ec2Client := ec2.NewFromConfig(awsCfg)
+	//get list of availability zones which are part of the region in event and store it in input variable
+	input := &ec2.DescribeAvailabilityZonesInput{}
+	output, err := ec2Client.DescribeAvailabilityZones(context.TODO(),input)
+	//log.Printf("[updateKarpenterNodePool] Retrieved %d AZs from event", output.AvailabilityZones)
+	log.Printf("[updateKarpenterNodePool] Retrieved %d AZs from event", output.AvailabilityZones)
+	if err != nil {
+		log.Printf("[updateKarpenterNodePool] Failed to describe availability zones: %v", err)
+	}
+	log.Printf("[updateKarpenterNodePool] Retrieved %d AZs from EC2 API", len(output.AvailabilityZones))
+	//
+	var updatedZones []string
+	for _, az := range output.AvailabilityZones {
+		log.Printf("[updateKarpenterNodePool] Checking AZ: ZoneId=%s, ZoneName=%s", *az.ZoneId, *az.ZoneName)
+		if *az.ZoneId != event.Detail.Metadata.AwayFrom {
+			log.Printf("[updateKarpenterNodePool] Including AZ %s in updated zones", *az.ZoneName)
+			updatedZones = append(updatedZones, *az.ZoneName)
+		} else {
+			log.Printf("[updateKarpenterNodePool] Excluding AZ %s as it matches AwayFrom zone", *az.ZoneName)
+		}
+	}
+	// Log the updated zones
+	log.Printf("[updateKarpenterNodePool] Updated zones: %v", updatedZones)
+	//return updatedZones to the calling function
+	return updatedZones
+}
+
 // updateKarpenterNodePool updates the Karpenter node pool based on the event
 func updateKarpenterNodePool(event Event) {
 	log.Printf("[updateKarpenterNodePool] Processing event for AZ: %s", event.Detail.Metadata.AwayFrom)
@@ -208,51 +323,64 @@ func updateKarpenterNodePool(event Event) {
 	rawJSON, _ := json.MarshalIndent(nodePoolList, "", "  ")
 	log.Printf("[updateKarpenterNodePool] Raw node pool list: %s", string(rawJSON))
 
-	awsCfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		log.Printf("Failed to load AWS config: %v", err)
-		return
-	}
+	//Define newNodePool with NodePool Struture
+	var newNodePool NodePool
 
-	ec2Client := ec2.NewFromConfig(awsCfg)
+	// Check if the length of the nodepool is 2 and the nodepool names are "general-purpose" and "system"
+	if len(nodePoolList.Items) == 2 && nodePoolList.Items[0].Metadata.Name == "general-purpose" && nodePoolList.Items[1].Metadata.Name == "system" {
+		log.Println("[updateKarpenterNodePool] Found 2 EKS Auto mode default node pools, creating a new node pool")
+		//create a new node pool zonal-shift-karpenter copying the "general-purpose" nodepool
+		newNodePool := nodePoolList.Items[0]
+		newNodePool.APIVersion = "karpenter.sh/v1"
+		newNodePool.Kind = "NodePool"
+		newNodePool.Metadata.Name = "zonal-shift-karpenter"
+		log.Printf("[updateKarpenterNodePool] Calling function getUpdatedZones to get healthy zones")
+		updatedZones := getUpdatedZones(event)
+		//Update spec.Template.Spec.Requirements with a new requirment "topolozy.kubernetes.io/zone" with value updatedZones
+		newNodePool.Spec.Template.Spec.Requirements = append(newNodePool.Spec.Template.Spec.Requirements, struct {
+			Key      string   `json:"key"`
+			Operator string   `json:"operator"`
+			Values   []string `json:"values"`
+			} {
+			Key:      "topology.kubernetes.io/zone",
+			Operator: "In",
+			Values:   updatedZones,
+		})
+		
+		//if err := json.Unmarshal(newNodePool, &NodePool); err != nil {
+		//log.Printf("[updateKarpenterNodePool] Failed to parse new node pools config: %v", err)
+		//return
+		//}
+		
+		// Let's log the raw JSON for debugging
+		newNodePoolrawJSON, _ := json.MarshalIndent(newNodePool, "", "  ")
+		log.Printf("[updateKarpenterNodePool] Raw node pool list: %s", string(newNodePoolrawJSON))
 
-	for _, pool := range nodePoolList.Items {
-		log.Printf("[updateKarpenterNodePool] Processing node pool: %s", pool.Metadata.Name)
-		log.Printf("[updateKarpenterNodePool] Number of requirements: %d", len(pool.Spec.Template.Spec.Requirements))
-		for i, req := range pool.Spec.Template.Spec.Requirements {
-			log.Printf("[updateKarpenterNodePool] Checking requirement %d: Key=%s", i, req.Key)
-			if req.Key == "topology.kubernetes.io/zone" {
-				log.Printf("[updateKarpenterNodePool] Node pool %s has a zone requirement: %+v", pool.Metadata.Name, req.Values)
-				input := &ec2.DescribeAvailabilityZonesInput{
-					ZoneNames: req.Values,
-				}
-				output, err := ec2Client.DescribeAvailabilityZones(context.TODO(), input)
-				if err != nil {
-					log.Printf("[updateKarpenterNodePool] Failed to describe availability zones: %v", err)
-					continue
-				}
-				log.Printf("[updateKarpenterNodePool] Retrieved %d AZs from EC2 API", len(output.AvailabilityZones))
-				var updatedZones []string
-				for _, az := range output.AvailabilityZones {
-					log.Printf("[updateKarpenterNodePool] Checking AZ: ZoneId=%s, ZoneName=%s", *az.ZoneId, *az.ZoneName)
-					if *az.ZoneId != event.Detail.Metadata.AwayFrom {
-						log.Printf("[updateKarpenterNodePool] Including AZ %s in updated zones", *az.ZoneName)
-						updatedZones = append(updatedZones, *az.ZoneName)
+		
+		//creating new node pool "zonal-shift-karpenter"
+		log.Printf("[updateKarpenterNodePool] Creating new node pool: %s", newNodePool.Metadata.Name)
+		ctx := context.Background()
+		err = CreateNodePool(ctx, "default", "zonal-shift-karpenter", newNodePoolrawJSON)
+		} else {
+		for _, pool := range nodePoolList.Items {
+			log.Printf("[updateKarpenterNodePool] Processing node pool: %s", pool.Metadata.Name)
+			log.Printf("[updateKarpenterNodePool] Number of requirements: %d", len(pool.Spec.Template.Spec.Requirements))
+			for i, req := range pool.Spec.Template.Spec.Requirements {
+				log.Printf("[updateKarpenterNodePool] Checking requirement %d: Key=%s", i, req.Key)
+				if req.Key == "topology.kubernetes.io/zone" {
+					log.Printf("[updateKarpenterNodePool] Node pool %s has a zone requirement: %+v", pool.Metadata.Name, req.Values)
+					updatedZones := getUpdatedZones(event)
+					if len(updatedZones) != len(req.Values) {
+						log.Printf("[updateKarpenterNodePool] Zone list changed for node pool %s:", pool.Metadata.Name)
+						log.Printf("[updateKarpenterNodePool] Original zones: %v", req.Values)
+						log.Printf("[updateKarpenterNodePool] Updated zones: %v", updatedZones)
+						log.Printf("[updateKarpenterNodePool] Updating node pool %s to remove AZ %s",
+							pool.Metadata.Name, event.Detail.Metadata.AwayFrom)
+						pool.Spec.Template.Spec.Requirements[i].Values = updatedZones
 					} else {
-						log.Printf("[updateKarpenterNodePool] Excluding AZ %s as it matches AwayFrom zone", *az.ZoneName)
+						log.Printf("[updateKarpenterNodePool] No changes needed for node pool %s - zones unchanged",
+							pool.Metadata.Name)
 					}
-				}
-
-				if len(updatedZones) != len(req.Values) {
-					log.Printf("[updateKarpenterNodePool] Zone list changed for node pool %s:", pool.Metadata.Name)
-					log.Printf("[updateKarpenterNodePool] Original zones: %v", req.Values)
-					log.Printf("[updateKarpenterNodePool] Updated zones: %v", updatedZones)
-					log.Printf("[updateKarpenterNodePool] Updating node pool %s to remove AZ %s",
-						pool.Metadata.Name, event.Detail.Metadata.AwayFrom)
-					pool.Spec.Template.Spec.Requirements[i].Values = updatedZones
-				} else {
-					log.Printf("[updateKarpenterNodePool] No changes needed for node pool %s - zones unchanged",
-						pool.Metadata.Name)
 				}
 			}
 		}
