@@ -8,13 +8,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
-	"crypto/tls"
 	"os"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	//"github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	//"github.com/aws/aws-sdk-go-v2/aws"
-	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -198,43 +194,24 @@ func CreateNodePool(ctx context.Context, namespace string,nodepoolName string, n
 		log.Printf("[CreateNodePool] Failed to create cluster config: %v", err)
 		return fmt.Errorf("failed to create cluster config: %v", err)
 	}
-
-    // Create the request URL
-    url := fmt.Sprintf("%s/apis/karpenter.sh/v1/nodepools",
-        k8sConfig.Host,
-    )
-    
-    log.Printf("[CreateNodePool] Manifest: %v", bytes.NewBuffer(nodePoolSpec))
-
-    // Create the HTTP request
-    req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(nodePoolSpec))
-    if err != nil {
-        return fmt.Errorf("failed to create request: %v", err)
-    }
-
-    // Set headers
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", k8sConfig.BearerToken))
 	
-	// Execute the request
-    tr := &http.Transport{
-        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-    }
-    client := &http.Client{Transport: tr}
-    resp, err := client.Do(req)
-    
-    if err != nil {
-        return fmt.Errorf("failed to execute request: %v", err)
-    }
-    log.Printf("response Body : %v", resp.Body)
-    defer resp.Body.Close()
+	clientset, err := kubernetes.NewForConfig(k8sConfig)
+	if err != nil {
+		log.Printf("[CreateNodePool] Failed to create clientset: %v", err)
+		return fmt.Errorf("Failed to create clientset")
+	}
+	
+	
+	resp, err := clientset.RESTClient().Post().AbsPath("/apis/karpenter.sh/v1/nodepools").Body(nodePoolSpec).DoRaw(context.TODO())
+	if err != nil {
+		log.Printf("[CreateNodePool] Failed to CreateNodePool node pools: %v", err)
+		return fmt.Errorf("Failed to update node pools")
+	}
+	log.Printf("[CreateNodePool] Succesfully created node pools: %v", nodepoolName)
+	resp_json, err := json.Marshal(resp)
+	log.Printf("[CreateNodePool] Response: %v", resp_json)
 
-    // Check response status
-    if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-        return fmt.Errorf("failed to create nodepool, status: %d", resp.StatusCode)
-    }
-
-    return nil
+	return nil
 }
 
 
@@ -431,6 +408,21 @@ func updateKarpenterNodePool(event Event) {
 						log.Printf("[updateKarpenterNodePool] Updating node pool %s to remove AZ %s",
 							pool.Metadata.Name, event.Detail.Metadata.AwayFrom)
 						pool.Spec.Template.Spec.Requirements[i].Values = updatedZones
+						//Update the Nodepool with the updatedzones using clientset
+						pool_json, err := json.Marshal(pool)
+						if err != nil {
+							log.Printf("[updateKarpenterNodePool] Failed to parse Nodepool : %v", err)
+							return (err)
+						}
+						log.Printf("[CreateNodePool] pool_json: %v", pool_json)
+						resp_update, err := clientset.RESTClient().Put().AbsPath("/apis/karpenter.sh/v1/nodepools").Body(pool_json).DoRaw(context.TODO())
+						if err != nil {
+							log.Printf("[updateKarpenterNodePool] Failed to update node pools: %v", err)
+							return (err)
+						}
+						resp_update_json, err := json.Marshal(resp_update)
+						log.Printf("[CreateNodePool] Response: %v", resp_update_json)
+						
 		// No need to set NodeClassRef here as it's not accessible in this struct
 					} else {
 						log.Printf("[updateKarpenterNodePool] No changes needed for node pool %s - zones unchanged",
