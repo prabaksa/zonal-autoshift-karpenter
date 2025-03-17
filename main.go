@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
+	"crypto/tls"
 	"os"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -74,6 +75,8 @@ type NodePool struct {
                 } `json:"requirements"`
                 NodeClassRef struct {
                     Name string `json:"name"`
+					Kind string `json:"kind"`
+					Group string `json:"group"`
                 } `json:"nodeClassRef"`
             } `json:"spec"`
         } `json:"template"`
@@ -189,24 +192,19 @@ func handleEvent(event Event) {
 }
 
 // CreateNodePool creates a new Karpenter NodePool
-func CreateNodePool(ctx context.Context, nodepoolName, namespace string, nodePoolSpec []byte) error {
+func CreateNodePool(ctx context.Context, namespace string,nodepoolName string, nodePoolSpec []byte) error {
     k8sConfig, err := rest.InClusterConfig()
 	if err != nil {
 		log.Printf("[CreateNodePool] Failed to create cluster config: %v", err)
 		return fmt.Errorf("failed to create cluster config: %v", err)
 	}
 
-	//clientset, err := kubernetes.NewForConfig(k8sConfig)
-	//if err != nil {
-	//	log.Printf("[CreateNodePool] Failed to create clientset: %v", err)
-	//	return fmt.Errorf("failed to create clientset: %v", err)
-	//}
-    
     // Create the request URL
-    url := fmt.Sprintf("%s/apis/karpenter.sh/v1/namespaces/%s/nodepools",
+    url := fmt.Sprintf("%s/apis/karpenter.sh/v1/nodepools",
         k8sConfig.Host,
-        namespace,
     )
+    
+    log.Printf("[CreateNodePool] Manifest: %v", bytes.NewBuffer(nodePoolSpec))
 
     // Create the HTTP request
     req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(nodePoolSpec))
@@ -216,14 +214,19 @@ func CreateNodePool(ctx context.Context, nodepoolName, namespace string, nodePoo
 
     // Set headers
     req.Header.Set("Content-Type", "application/json")
-    //req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", clientset.BearerToken))
-
-    // Execute the request
-    client := &http.Client{}
+    req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", k8sConfig.BearerToken))
+	
+	// Execute the request
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+    }
+    client := &http.Client{Transport: tr}
     resp, err := client.Do(req)
+    
     if err != nil {
         return fmt.Errorf("failed to execute request: %v", err)
     }
+    log.Printf("response Body : %v", resp.Body)
     defer resp.Body.Close()
 
     // Check response status
@@ -323,59 +326,95 @@ func updateKarpenterNodePool(event Event) {
 	rawJSON, _ := json.MarshalIndent(nodePoolList, "", "  ")
 	log.Printf("[updateKarpenterNodePool] Raw node pool list: %s", string(rawJSON))
 
-	//Define newNodePool with NodePool Struture
-	var newNodePool NodePool
-
 	// Check if the length of the nodepool is 2 and the nodepool names are "general-purpose" and "system"
-	if len(nodePoolList.Items) == 2 && nodePoolList.Items[0].Metadata.Name == "general-purpose" && nodePoolList.Items[1].Metadata.Name == "system" {
+	if len(nodePoolList.Items) == 2 && 
+	   ((nodePoolList.Items[0].Metadata.Name == "general-purpose" && nodePoolList.Items[1].Metadata.Name == "system") ||
+	    (nodePoolList.Items[1].Metadata.Name == "general-purpose" && nodePoolList.Items[0].Metadata.Name == "system")) {
 		log.Println("[updateKarpenterNodePool] Found 2 EKS Auto mode default node pools, creating a new node pool")
 		//create a new node pool zonal-shift-karpenter copying the "general-purpose" nodepool
-		var nodePoolItem struct {
-			APIVersion string `json:"apiVersion"`
-			Kind       string `json:"kind"`
-			Metadata   struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-			Spec struct {
-				Template struct {
-					Spec struct {
-						Requirements []struct {
-							Key      string   `json:"key"`
-							Operator string   `json:"operator"`
-							Values   []string `json:"values"`
-						} `json:"requirements"`
-					} `json:"spec"`
-				} `json:"template"`
-			} `json:"spec"`
+		// Create a new NodePool with the correct structure
+		nodePoolItem := NodePool{
+			APIVersion: "karpenter.sh/v1",
+			Kind:       "NodePool",
+			Metadata: struct {
+				Name      string            `json:"name"`
+				Namespace string            `json:"namespace"`
+				Labels    map[string]string `json:"labels,omitempty"`
+			}{
+				Name: "zonal-shift-karpenter",
+				Namespace: "default",
+			},
 		}
 		
-		nodePoolItem = nodePoolList.Items[0]
+		// Copy over the requirements from the existing nodepool
+		// but don't try to directly assign the Spec which has a different structure
+		
+		// Initialize the template and spec structures
+		nodePoolItem.Spec.Template.Spec.Requirements = make([]struct {
+			Key      string   `json:"key"`
+			Operator string   `json:"operator"`
+			Values   []string `json:"values"`
+		}, 0)
+		
+		// Copy requirements from the existing nodepool
+		for _, req := range nodePoolList.Items[0].Spec.Template.Spec.Requirements {
+			nodePoolItem.Spec.Template.Spec.Requirements = append(
+				nodePoolItem.Spec.Template.Spec.Requirements,
+				struct {
+					Key      string   `json:"key"`
+					Operator string   `json:"operator"`
+					Values   []string `json:"values"`
+				}{
+					Key:      req.Key,
+					Operator: req.Operator,
+					Values:   req.Values,
+				},
+			)
+		}
 		nodePoolItem.APIVersion = "karpenter.sh/v1"
 		nodePoolItem.Kind = "NodePool"
 		nodePoolItem.Metadata.Name = "zonal-shift-karpenter"
 		
+		// Copy the node class reference from the existing node pool
+		nodePoolItem.Spec.Template.Spec.NodeClassRef.Name = "default"
+		nodePoolItem.Spec.Template.Spec.NodeClassRef.Kind = "NodeClass"
+		nodePoolItem.Spec.Template.Spec.NodeClassRef.Group = "eks.amazonaws.com"
+
 		log.Printf("[updateKarpenterNodePool] Calling function getUpdatedZones to get healthy zones")
 		updatedZones := getUpdatedZones(event)
 		
-		//Update spec.Template.Spec.Requirements with a new requirement "topology.kubernetes.io/zone" with value updatedZones
-		nodePoolItem.Spec.Template.Spec.Requirements = append(nodePoolItem.Spec.Template.Spec.Requirements, struct {
-			Key      string   `json:"key"`
-			Operator string   `json:"operator"`
-			Values   []string `json:"values"`
-		}{
-			Key:      "topology.kubernetes.io/zone",
-			Operator: "In",
-			Values:   updatedZones,
-		})
+		// Update the requirements with the new zones
+		zoneRequirementExists := false
+		for i, req := range nodePoolItem.Spec.Template.Spec.Requirements {
+			if req.Key == "topology.kubernetes.io/zone" {
+				nodePoolItem.Spec.Template.Spec.Requirements[i].Values = updatedZones
+				zoneRequirementExists = true
+				break
+			}
+		}
 		
-		// Let's log the raw JSON for debugging
-		newNodePoolrawJSON, _ := json.MarshalIndent(nodePoolItem, "", "  ")
-		log.Printf("[updateKarpenterNodePool] Raw node pool list: %s", string(newNodePoolrawJSON))
+		// If no zone requirement exists, add one
+		if !zoneRequirementExists {
+			nodePoolItem.Spec.Template.Spec.Requirements = append(nodePoolItem.Spec.Template.Spec.Requirements, struct {
+				Key      string   `json:"key"`
+				Operator string   `json:"operator"`
+				Values   []string `json:"values"`
+			}{
+				Key:      "topology.kubernetes.io/zone",
+				Operator: "In",
+				Values:   updatedZones,
+			})
+		}
 		
-		//creating new node pool "zonal-shift-karpenter"
+		// Convert nodePoolItem to JSON
+		newNodePoolJSON, err := json.Marshal(nodePoolItem)
+		if err != nil {
+			log.Printf("[updateKarpenterNodePool] Failed to marshal new node pool: %v", err)
+			return
+		}
 		log.Printf("[updateKarpenterNodePool] Creating new node pool: %s", nodePoolItem.Metadata.Name)
 		ctx := context.Background()
-		err = CreateNodePool(ctx, "default", "zonal-shift-karpenter", newNodePoolrawJSON)
+		err = CreateNodePool(ctx, "default", "zonal-shift-karpenter", newNodePoolJSON)
 		} else {
 		for _, pool := range nodePoolList.Items {
 			log.Printf("[updateKarpenterNodePool] Processing node pool: %s", pool.Metadata.Name)
@@ -392,6 +431,7 @@ func updateKarpenterNodePool(event Event) {
 						log.Printf("[updateKarpenterNodePool] Updating node pool %s to remove AZ %s",
 							pool.Metadata.Name, event.Detail.Metadata.AwayFrom)
 						pool.Spec.Template.Spec.Requirements[i].Values = updatedZones
+		// No need to set NodeClassRef here as it's not accessible in this struct
 					} else {
 						log.Printf("[updateKarpenterNodePool] No changes needed for node pool %s - zones unchanged",
 							pool.Metadata.Name)
